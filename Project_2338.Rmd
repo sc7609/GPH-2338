@@ -1,0 +1,433 @@
+---
+title: "Project_2338"
+output: pdf_document
+date: "2025-04-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(leaps)
+library(tidyverse)
+library(caret)
+library(pROC)
+library(glmnet)
+library(r02pro) 
+library(MASS)
+library(ISLR)
+```
+
+```{r}
+heart <- read.csv("heart.csv")
+```
+
+# Feature Selection
+```{r}
+# Forward Stepwise Selection with adjusted R^2
+forward_fit <- regsubsets(target ~., data = heart, method = "forward", nvmax = 8)
+forward_sum <- summary(forward_fit)
+best_ind_for <- which.max(forward_sum$adjr2)
+best_model_forward <- coef(forward_fit, best_ind_for)
+best_model_forward
+```
+
+```{r}
+# Backward Stepwise Selection with Cp
+backward_fit <- regsubsets(target ~ ., data = heart, method = "backward", nvmax = 8)
+backward_sum <- summary(backward_fit)
+best_ind_back <- which.min(backward_sum$cp)
+best_model_backward <- coef(backward_fit, best_ind_back)
+best_model_backward
+```
+
+```{r}
+# PCA selection
+pr.out <- prcomp(heart, scale = FALSE)
+pr.rot <- as.data.frame(pr.out$rotation)
+ggplot(pr.rot, aes(x = PC1, y = PC2)) +
+  geom_point() +
+  geom_segment(aes(x = 0, y = 0, xend = PC1, yend = PC2),
+               arrow = arrow(length = unit(0.5, "cm"))) +
+  geom_text(label = rownames(pr.rot))
+```
+
+```{r}
+pr.var <- pr.out$sdev^2
+pve <- pr.var / sum(pr.var)
+
+cum_var <- cumsum(pve)
+n_components <- which(cum_var >= 0.8)[1]
+```
+
+
+```{r}
+par(mfrow = c(1, 2))
+plot(pve, xlab = "Principal Component", ylab = "Proportion of Variance Explained", ylim = c(0, 1), type = "b")
+plot(cumsum(pve), xlab = "Principal Component", ylab = "Cumulative Proportion of Variance Explained", ylim = c(0, 1), type = "b")
+```
+```{r}
+names(heart)
+```
+# Split to train and test data
+
+```{r}
+library(dplyr)
+set.seed(1)
+heart <- dplyr::select(heart,
+  `chest.pain.type`, `cholesterol`, `fasting.blood.sugar`,
+  `max.heart.rate`, `exercise.angina`, `oldpeak`, `ST.slope`, `target`
+)
+tr_ind <- sample(1:nrow(heart), 0.8 * nrow(heart))
+heart_train <- heart[tr_ind, ]
+heart_test <- heart[-tr_ind, ]
+```
+
+# Logistic Regression
+
+```{r}
+logistic_model <- glm(target ~., data = heart_train, family = "binomial")
+
+summary(logistic_model)
+predict_train_prob <- predict(logistic_model, type = "response")
+predict_train_label <- ifelse(predict_train_prob > 0.5, "1", "0")
+train_error <- mean(predict_train_label != heart_train$target)
+print(train_error)
+```
+
+```{r}
+predict_test_prob <- predict(logistic_model, newdata = heart_test, type = "response")
+predict_test_label <- ifelse(predict_test_prob > 0.5, "1", "0")
+test_error <- mean(predict_test_label != heart_test$target)
+print(test_error)
+```
+
+```{r}
+# aucroc
+roc_logistic <- roc(heart_test$target, predict_test_prob)
+auc_logistic <- auc(roc_logistic)
+plot(roc_logistic, col = "red", lwd = 2, main = "ROC Curve - Logistic Regression (Test Set)")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+```
+
+````{r}
+# cross-validation
+set.seed(1)
+
+K <- 5
+n_all <- nrow(heart)
+fold_ind <- sample(1:K, n_all, replace = TRUE)
+error_lr <- mean(sapply(1:K, function(j){
+    fit <- glm(target ~ ., data = heart[fold_ind != j, ],
+               family = "binomial")
+    pred_prob <- predict(fit, newdata = heart[fold_ind == j, ], type = "response")
+    pred_label <- ifelse(pred_prob > 0.5, "1", "0")
+  mean(heart$target[fold_ind == j] != pred_label)
+  }))
+error_lr
+```
+
+```{r}
+set.seed(1)
+
+X_train <- heart_train[, -which(names(heart_train) == "target")]
+Y_train <- heart_train$target
+X_test <- heart_test[, -which(names(heart_test) == "target")]
+Y_test <- heart_test$target
+Y_test <- as.factor(Y_test)
+
+# Set up the trainControl for 5-fold cross-validation
+ctrl <- trainControl(method = "cv", number = 5)
+
+# Define the tuning grid for alpha and lambda
+grid <- expand.grid(alpha = seq(0, 1, by = 0.1), lambda = seq(0.05, 0.1, by = 0.002))
+
+#Perform 5-fold cross-validation to tune hyperparameters
+logi_reg_model <- train(x = X_test,y = Y_test,method = "glmnet",trControl = ctrl,
+                        tuneGrid = grid,metric = "Accuracy")
+print(logi_reg_model)
+logi_reg_model$bestTune
+```
+
+```{r}
+# training error
+train_predict_logiregu <- predict(logi_reg_model, X_train)
+train_error_logiregu <- mean(train_predict_logiregu != Y_train)
+train_error_logiregu
+```
+
+```{r}
+# test error
+test_predict_logiregu <- predict(logi_reg_model, X_test)
+test_error_logiregu <- mean(test_predict_logiregu != Y_test)
+test_error_logiregu
+```
+
+```{r}
+# rocauc
+roc_logiregu <- roc(Y_test, as.numeric(test_predict_logiregu), levels = rev(levels(Y_test)))
+auc_logiregu <- auc(roc_logiregu)
+auc_logiregu
+```
+
+
+# Lasso Regression
+
+```{r}
+set.seed(1)
+
+x_train <- model.matrix(target ~ ., data = heart_train)[, -1]
+y_train <- heart_train$target
+x_test  <- model.matrix(target ~ ., data = heart_test)[, -1]
+y_test  <- heart_test$target
+
+cv_fit <- cv.glmnet(x_train, y_train, alpha = 1, family = "binomial", type.measure = "class", nfolds = 10)
+plot(cv_fit)
+```
+
+```{r}
+best_lambda <- cv_fit$lambda.min
+cat("Best lambda:", best_lambda, "\n")
+lasso_model <- glmnet(x_train, y_train, family="binomial", alpha=1, lambda=best_lambda)
+```
+
+```{r}
+pred_prob_train <- predict(lasso_model, newx = x_train, type = "response")
+pred_prob_test  <- predict(lasso_model, newx = x_test, type = "response")
+
+pred_class_train <- ifelse(pred_prob_train > 0.5, "1", "0")
+pred_class_test  <- ifelse(pred_prob_test > 0.5, "1", "0")
+
+train_error_lasso <- mean((pred_class_train != y_train)^2)
+test_error_lasso  <- mean((pred_class_test  != y_test)^2)
+
+print(train_error_lasso)
+print(test_error_lasso)
+```
+
+````{r}
+# cross-validation
+set.seed(1)
+
+K <- 5
+n_all <- nrow(heart)
+fold_ind <- sample(1:K, n_all, replace = TRUE)
+x <- model.matrix(target ~ ., data = heart)[, -1]
+y <- heart$target
+error_lasso <- mean(sapply(1:K, function(j) {
+  # Training and validation split
+  x_train <- x[fold_ind != j, ]
+  y_train <- y[fold_ind != j]
+  x_valid <- x[fold_ind == j, ]
+  y_valid <- y[fold_ind == j]
+
+  # Fit LASSO model with CV on training set to get best lambda
+  cv_fit <- cv.glmnet(x_train, y_train, family = "binomial", alpha = 1, type.measure = "class")
+  best_lambda <- cv_fit$lambda.min
+
+  # Predict on validation fold
+  pred_prob <- predict(cv_fit, newx = x_valid, s = best_lambda, type = "response")
+  pred_label <- ifelse(pred_prob > 0.5, 1, 0)
+
+  # Misclassification error
+  mean(y_valid != pred_label)
+}))
+error_lasso
+```
+
+```{r}
+
+library(pROC)
+
+# Ensure both are numeric vectors of the same length
+roc_lasso <- roc(as.numeric(y_test), as.numeric(pred_prob_test[, 1]))
+
+# AUC value
+auc_lasso <- auc(roc_lasso)
+cat("LASSO Test AUC:", round(auc_lasso, 4), "\n")
+
+# Plot ROC
+plot(roc_lasso, col = "blue", lwd = 2, main = "ROC Curve - LASSO Model (Test Set)")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+```
+
+
+# Compare AIC
+```{r}
+set.seed(1)
+
+aic_lr <- AIC(logistic_model)
+deviance_lasso <- deviance(lasso_model)
+df_lasso <- lasso_model$df
+aic_lasso <- deviance_lasso + 2 * df_lasso
+
+cat("AIC - Logistic Regression (glm):", round(aic_lr, 2), "\n")
+cat("AIC - LASSO (glmnet):", round(aic_lasso, 2), "\n")
+```
+```{r}
+library(MASS)
+library(tree)
+library(readr)
+library(caret)
+library(randomForest)
+library(forcats)
+
+set.seed(1)
+#Load data
+heart_data <- read_csv("heart.csv")
+
+#Recode sex
+heart_data$sex <- as.factor(heart_data$sex)
+heart_data$sex <- fct_recode(heart_data$sex, "male" = "1", "female" = "0")
+
+#Recode target to valid R variable names
+heart_data$target <- as.factor(heart_data$target)
+heart_data$target <- fct_recode(heart_data$target, "No" = "0", "Yes" = "1")
+
+#Creation of train/test data
+h_ind <- createDataPartition(heart_data$target, p = 0.8, list = FALSE)
+heart_train <- heart_data[h_ind, ]
+heart_test <- heart_data[-h_ind, ]
+
+#PCA for variable selection (exclude target and separate numeric/categorical)
+numeric_cols <- sapply(heart_train, is.numeric) & colnames(heart_train) != "target"
+heart_train_numeric <- heart_train[, numeric_cols]
+categorical_cols <- !numeric_cols & colnames(heart_train) != "target"
+heart_train_categorical <- heart_train[, categorical_cols, drop = FALSE]
+
+# Scale numeric predictors
+heart_scale <- scale(heart_train_numeric)
+
+#Perform PCA on numeric predictors
+pca_result <- prcomp(heart_scale, center = TRUE, scale. = TRUE)
+loadings <- pca_result$rotation
+important_vars <- names(sort(abs(loadings[, 1]), decreasing = TRUE))[1:5]  # Top 5 from PC1
+important_vars <- unique(c(important_vars, names(sort(abs(loadings[, 2]), decreasing = TRUE))[1:4]))  # Top 4 from PC2
+important_vars2 <- important_vars[!important_vars %in% c("target", "resting ecg")] # Exclude target and resting ecg
+
+#Combine selected numeric variables with all categorical variables
+selected_cols <- c(important_vars2, colnames(heart_train_categorical))
+train_selected <- heart_train[, selected_cols]
+test_selected <- heart_test[, selected_cols]
+
+#Prepare training data for Random Forest
+rf_train_data <- data.frame(train_selected, target = as.factor(heart_train$target))
+
+#Convert categorical predictors to factors
+if ("st slope" %in% colnames(rf_train_data)) rf_train_data$`st slope` <- as.factor(rf_train_data$`st slope`)
+if ("resting ecg" %in% colnames(rf_train_data)) rf_train_data$`resting ecg` <- as.factor(rf_train_data$`resting ecg`)
+if ("exercise angina" %in% colnames(rf_train_data)) rf_train_data$`exercise angina` <- as.factor(rf_train_data$`exercise angina`)
+if ("sex" %in% colnames(rf_train_data)) rf_train_data$sex <- as.factor(rf_train_data$sex)
+if ("chest pain type" %in% colnames(rf_train_data)) rf_train_data$`chest pain type` <- as.factor(rf_train_data$`chest pain type`)
+
+#Define custom summary function to include Accuracy, Kappa, ROC, Sens, Spec
+customSummary <- function(data, lev = NULL, model = NULL) {
+  out <- c(defaultSummary(data, lev, model), twoClassSummary(data, lev, model))
+  out
+}
+
+#Define 5-fold cross-validation
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  savePredictions = "final",
+  classProbs = TRUE,
+  summaryFunction = customSummary,  # Includes Accuracy, Kappa, ROC, Sens, Spec
+  returnResamp = "all"
+)
+#Train Random Forest with 5-fold CV
+rf_cv_model <- train(
+  target ~ .,
+  data = rf_train_data,
+  method = "rf",
+  trControl = train_control,
+  ntree = 500,
+  tuneGrid = data.frame(mtry = sqrt(ncol(rf_train_data) - 1)),
+  metric = "Accuracy"
+)
+
+#Cross-validation training error
+cv_accuracy <- mean(rf_cv_model$results$Accuracy)
+cv_error <- 1 - cv_accuracy
+cat("5-Fold CV Training Error:", cv_error, "\n")
+
+#Explicit training error (predict on full training data)
+train_predictions <- predict(rf_cv_model, newdata = rf_train_data, type = "raw")
+train_confusion <- table(rf_train_data$target, train_predictions)
+train_accuracy <- sum(diag(train_confusion)) / sum(train_confusion)
+train_error <- 1 - train_accuracy
+cat("Training Error (Explicit):", train_error, "\n")
+
+#Print CV results
+print(rf_cv_model)
+
+#Prepare test data for prediction
+rf_test_data <- data.frame(test_selected, target = as.factor(heart_test$target))
+
+#Convert categorical predictors to factors in test data
+if ("st slope" %in% colnames(rf_test_data)) rf_test_data$`st slope` <- as.factor(rf_test_data$`st slope`)
+if ("resting ecg" %in% colnames(rf_test_data)) rf_test_data$`resting ecg` <- as.factor(rf_test_data$`resting ecg`)
+if ("exercise angina" %in% colnames(rf_test_data)) rf_test_data$`exercise angina` <- as.factor(rf_test_data$`exercise angina`)
+if ("sex" %in% colnames(rf_test_data)) rf_test_data$sex <- as.factor(rf_test_data$sex)
+if ("chest pain type" %in% colnames(rf_test_data)) rf_test_data$`chest pain type` <- as.factor(rf_test_data$`chest pain type`)
+
+#Predict on test data
+test_predictions <- predict(rf_cv_model, newdata = rf_test_data, type = "raw")
+
+#Test error
+test_confusion <- table(rf_test_data$target, test_predictions)
+test_accuracy <- sum(diag(test_confusion)) / sum(test_confusion)
+test_error <- 1 - test_accuracy
+cat("Test Error:", test_error, "\n")
+
+#Variable importance
+varImp(rf_cv_model)
+plot(varImp(rf_cv_model))
+```
+
+```{r}
+library(pROC)
+
+# Get predicted probabilities for test data
+test_prob <- predict(rf_cv_model, newdata = rf_test_data, type = "prob")
+
+# Ensure target is binary factor with levels: "No", "Yes"
+rf_test_data$target <- factor(rf_test_data$target, levels = c("No", "Yes"))
+
+# Compute ROC and AUC for "Yes" class
+roc_rf <- roc(response = rf_test_data$target,
+              predictor = test_prob$Yes,
+              levels = c("No", "Yes"),
+              direction = "<")
+
+# Print AUC
+auc_rf <- auc(roc_rf)
+cat("Random Forest Test AUC:", round(auc_rf, 4), "\n")
+
+# Plot ROC curve
+plot(roc_rf, col = "darkgreen", lwd = 2, main = "ROC Curve - Random Forest (Test Set)")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+```
+
+```{r}
+library(pROC)
+
+# Plot all ROC curves
+plot(roc_logistic, col = "red", lwd = 2, main = "Comparison of ROC Curves")
+plot(roc_lasso, col = "blue", lwd = 2, add = TRUE)
+plot(roc_rf, col = "darkgreen", lwd = 2, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+legend("bottomright",
+       legend = c("Logistic Regression", "LASSO Regression", "Random Forest"),
+       col = c("red", "blue", "darkgreen"),
+       lwd = 2)
+
+
+```
+
+
